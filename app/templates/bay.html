@@ -113,9 +113,11 @@
             <h3 style="font-size:0.95rem;margin:1.25rem 0 0.4rem;color:#1f4d6b">近几笔浸染
               <span style="font-weight:400;color:#6b7c85"
                     x-text="'（角标 ' + (selected().recentLotClaimed || 0) + ' 笔）'"></span>
-              <a :href="'/bay/vats/' + selected().id + '/lots-fragment'" style="margin-left:0.5rem;font-size:0.85rem">列表片段</a>
+              <button type="button" class="link-btn" :disabled="lotLoading"
+                      @click="refreshLots()"
+                      x-text="lotLoading ? '刷新中…' : '列表片段'"></button>
             </h3>
-            <ul class="lot-list">
+            <ul class="lot-list" x-show="lotFragmentVat !== selected().id">
               <template x-for="l in selected().recentLots" :key="l.id">
                 <li>
                   <span x-text="l.dippedAt"></span>
@@ -128,6 +130,9 @@
               </template>
               <li x-show="!selected().recentLots.length" style="border:0;color:#6b7c85">尚无记录</li>
             </ul>
+            <ul class="lot-list" x-cloak x-show="lotFragmentVat === selected().id" x-html="lotFragmentHtml"></ul>
+            <p class="lot-refresh-note" x-show="lotRefreshError" x-text="lotRefreshError"
+               style="margin:0.4rem 0 0;font-size:0.8rem;color:#8b1e1e"></p>
           </div>
         </div>
       </div>
@@ -144,6 +149,10 @@
       vats: {{ vats | tojson }},
       filterWs: {{ filter_workshop if filter_workshop is not none else 'null' }},
       selectedId: {{ selected_vat if selected_vat is not none else 'null' }},
+      lotLoading: false,
+      lotFragmentVat: null,
+      lotFragmentHtml: '',
+      lotRefreshError: '',
       init() {
         const params = new URLSearchParams(window.location.search);
         if (params.has('workshop') && this.filterWs === null) {
@@ -172,6 +181,9 @@
       },
       toggle(id) {
         this.selectedId = this.selectedId === id ? null : id;
+        // 切缸即收起片段视图，回落到该缸自带的近笔，避免上一缸片段残留
+        this.lotFragmentVat = null;
+        this.lotRefreshError = '';
         const url = new URL(window.location.href);
         if (this.selectedId) url.searchParams.set('vat', this.selectedId);
         else url.searchParams.delete('vat');
@@ -185,6 +197,32 @@
         const d = new Date();
         d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
         return d.toISOString().slice(0, 16);
+      },
+      async refreshLots() {
+        const vat = this.selected();
+        if (!vat || this.lotLoading) return;
+        this.lotLoading = true;
+        this.lotRefreshError = '';
+        try {
+          const resp = await fetch('/bay/vats/' + vat.id + '/lots-fragment', {
+            headers: { 'X-Partial': '1' },
+            credentials: 'same-origin',
+          });
+          if (!resp.ok) throw new Error('HTTP ' + resp.status);
+          const html = await resp.text();
+          const total = parseInt(resp.headers.get('X-Lot-Total') || '', 10);
+          // 成功才注入；按缸 id 归属，切缸不会落到别缸
+          this.lotFragmentHtml = html;
+          this.lotFragmentVat = vat.id;
+          if (!isNaN(total)) vat.recentLotClaimed = total;
+        } catch (e) {
+          // 失败不清空：收起片段视图，展开区仍显示该缸原有近笔，还原台可继续操作
+          this.lotFragmentVat = null;
+          this.lotFragmentHtml = '';
+          this.lotRefreshError = '片段读取失败，已保留当前近笔列表，请重试。';
+        } finally {
+          this.lotLoading = false;
+        }
       },
     };
   }

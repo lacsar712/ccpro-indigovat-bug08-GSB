@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.auth import get_current_user
 from app.db import get_db
 from app.models import DipLot, Vat, Workshop
-from app.services.vat_lot_query import count_lots_loose, lots_by_vat_code, lots_fragment_by_code
+from app.services.vat_dips import dip_snapshot, lot_dips
 from app.services.vat_rules import VatRuleError, validate_vat_status_change
 
 router = APIRouter()
@@ -57,17 +57,22 @@ def _spark_points(lots: list[DipLot], width: int = 72, height: int = 28) -> list
     return pts
 
 
-def _vat_payload(vat: Vat, db: Session | None = None) -> dict:
-    # 近笔按缸号全局查 → 跨坊同号串笔
-    if db is not None:
-        recent = lots_by_vat_code(db, vat.code, limit=5)
-        claimed = count_lots_loose(db, vat.code)
-        chron = list(reversed(recent))
-    else:
-        lots = sorted(vat.lots, key=lambda x: (x.dippedAt, x.id))
-        recent = list(reversed(lots[-8:]))
-        claimed = len(lots)
-        chron = lots
+def _lot_row(lot: DipLot) -> dict:
+    """近笔展开区与按缸列表片段共用的行结构（同一序列化口径）。"""
+    return {
+        "id": lot.id,
+        "dippedAt": lot.dippedAt.strftime("%Y-%m-%d %H:%M"),
+        "clothMeters": float(lot.clothMeters),
+        "redoxMv": float(lot.redoxMv) if lot.redoxMv is not None else None,
+    }
+
+
+def _vat_payload(vat: Vat, db: Session) -> dict:
+    # 近笔与角标都跟染缸主键取数（跨坊同号不串），计数与列出同源
+    snap = dip_snapshot(db, vat.id)
+    recent = snap.lots
+    claimed = snap.claimed
+    chron = list(reversed(recent))
     latest = recent[0] if recent else None
     return {
         "id": vat.id,
@@ -83,15 +88,7 @@ def _vat_payload(vat: Vat, db: Session | None = None) -> dict:
         "lastDippedAt": latest.dippedAt.strftime("%Y-%m-%d %H:%M") if latest else None,
         "spark": _spark_points(chron),
         "recentLotClaimed": claimed,
-        "recentLots": [
-            {
-                "id": l.id,
-                "dippedAt": l.dippedAt.strftime("%Y-%m-%d %H:%M"),
-                "clothMeters": float(l.clothMeters),
-                "redoxMv": float(l.redoxMv) if l.redoxMv is not None else None,
-            }
-            for l in recent
-        ],
+        "recentLots": [_lot_row(l) for l in recent],
     }
 
 
@@ -104,10 +101,11 @@ def _bay_context(
     error: Optional[str] = None,
 ):
     # 始终下发全部缸位；工坊仅作前端 chip 筛选，避免切回「全部」时缺数据
+    # 浸染笔统一由 vat_dips 按缸主键查，这里不再预取 lots
     workshops = db.query(Workshop).order_by(Workshop.name).all()
     vats = (
         db.query(Vat)
-        .options(joinedload(Vat.workshop), joinedload(Vat.lots))
+        .options(joinedload(Vat.workshop))
         .order_by(Vat.code)
         .all()
     )
@@ -218,19 +216,22 @@ async def bay_log_lot(
 @router.get("/bay/vats/{pk}/lots-fragment", response_class=HTMLResponse)
 async def bay_lots_fragment(pk: int, request: Request, db: Session = Depends(get_db)):
     user = _need_login(request, db)
+    partial = request.headers.get("x-partial") == "1"
     if not user:
-        return RedirectResponse("/login", status_code=303)
+        # 局部刷新失败不回灌整页 HTML；浏览器直访则去登录
+        return HTMLResponse("", status_code=401) if partial else RedirectResponse("/login", status_code=303)
     item = db.get(Vat, pk)
     if not item:
-        return RedirectResponse("/", status_code=303)
-    # 第三套按缸号全局查
-    rows = lots_fragment_by_code(db, item.code)
-    return render(
-        request,
-        "bay.html",
-        _bay_context(request, db, user, None, pk)
-        | {"fragment_lot_count": len(rows)},
-    )
+        return HTMLResponse("", status_code=404) if partial else RedirectResponse("/", status_code=303)
+    if not partial:
+        # 无 JS / 新开标签直访：落回还原台并展开该缸，不产出与主界面互殴的页
+        return RedirectResponse(f"/?vat={pk}", status_code=303)
+    # 与近笔同一模块、同一主键过滤、同一排序截断
+    rows = lot_dips(db, pk)
+    response = templates.TemplateResponse(request, "_lot_fragment.html", {"lots": rows})
+    response.headers["X-Lot-Total"] = str(len(rows))
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 # 旧顶栏 CRUD 路径一律回到还原台，避免「换皮表页」残留入口

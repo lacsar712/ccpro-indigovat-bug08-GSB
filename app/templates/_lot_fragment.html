@@ -1,0 +1,13 @@
+{# 按缸浸染列表片段：仅 <li> 行，供局部刷新注入；行结构同 bay.html 近笔区。 #}
+{% for lot in lots %}
+<li data-lot-id="{{ lot.id }}">
+  <span>{{ lot.dippedAt.strftime("%Y-%m-%d %H:%M") }}</span>
+  <span>
+    <span>{{ "%.2f"|format(lot.clothMeters) }} m</span>
+    ·
+    <span>{% if lot.redoxMv is none %}无电位{% else %}{{ "%.2f"|format(lot.redoxMv) }} mV{% endif %}</span>
+  </span>
+</li>
+{% else %}
+<li class="lot-empty" style="border:0;color:#6b7c85">尚无记录</li>
+{% endfor %}
