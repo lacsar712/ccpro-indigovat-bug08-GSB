@@ -7,12 +7,13 @@ from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from jinja2.utils import markupsafe
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
 
 from app.auth import get_current_user
 from app.db import get_db
 from app.models import DipLot, Vat, Workshop
-from app.services.vat_lot_query import count_lots_loose, lots_by_vat_code, lots_fragment_by_code
+from app.services import vat_dip_reads
 from app.services.vat_rules import VatRuleError, validate_vat_status_change
 
 router = APIRouter()
@@ -57,17 +58,20 @@ def _spark_points(lots: list[DipLot], width: int = 72, height: int = 28) -> list
     return pts
 
 
-def _vat_payload(vat: Vat, db: Session | None = None) -> dict:
-    # 近笔按缸号全局查 → 跨坊同号串笔
-    if db is not None:
-        recent = lots_by_vat_code(db, vat.code, limit=5)
-        claimed = count_lots_loose(db, vat.code)
-        chron = list(reversed(recent))
-    else:
-        lots = sorted(vat.lots, key=lambda x: (x.dippedAt, x.id))
-        recent = list(reversed(lots[-8:]))
-        claimed = len(lots)
-        chron = lots
+def _lot_dict(lot: DipLot) -> dict:
+    return {
+        "id": lot.id,
+        "dippedAt": lot.dippedAt.strftime("%Y-%m-%d %H:%M"),
+        "clothMeters": float(lot.clothMeters),
+        "redoxMv": float(lot.redoxMv) if lot.redoxMv is not None else None,
+    }
+
+
+def _vat_payload(vat: Vat, db: Session) -> dict:
+    # 近笔、角标、列表片段三处一律跟染缸主键（vat.id），同源同排序同截断；
+    # 不再按缸号全局查，跨坊同号不串笔。
+    recent, claimed = vat_dip_reads.vat_lot_view(db, vat.id)
+    chron = list(reversed(recent))
     latest = recent[0] if recent else None
     return {
         "id": vat.id,
@@ -83,15 +87,7 @@ def _vat_payload(vat: Vat, db: Session | None = None) -> dict:
         "lastDippedAt": latest.dippedAt.strftime("%Y-%m-%d %H:%M") if latest else None,
         "spark": _spark_points(chron),
         "recentLotClaimed": claimed,
-        "recentLots": [
-            {
-                "id": l.id,
-                "dippedAt": l.dippedAt.strftime("%Y-%m-%d %H:%M"),
-                "clothMeters": float(l.clothMeters),
-                "redoxMv": float(l.redoxMv) if l.redoxMv is not None else None,
-            }
-            for l in recent
-        ],
+        "recentLots": [_lot_dict(l) for l in recent],
     }
 
 
@@ -107,7 +103,7 @@ def _bay_context(
     workshops = db.query(Workshop).order_by(Workshop.name).all()
     vats = (
         db.query(Vat)
-        .options(joinedload(Vat.workshop), joinedload(Vat.lots))
+        .options(joinedload(Vat.workshop))
         .order_by(Vat.code)
         .all()
     )
@@ -222,14 +218,25 @@ async def bay_lots_fragment(pk: int, request: Request, db: Session = Depends(get
         return RedirectResponse("/login", status_code=303)
     item = db.get(Vat, pk)
     if not item:
+        # 缸已删除/不存在：回退还原台，不抛空白页
         return RedirectResponse("/", status_code=303)
-    # 第三套按缸号全局查
-    rows = lots_fragment_by_code(db, item.code)
+    base_context = _bay_context(request, db, user, item.workshop_id, pk)
+    try:
+        # 第三读路径同样跟染缸主键，与近笔/角标同排序、同截断
+        rows = vat_dip_reads.fragment_lots(db, pk)
+    except SQLAlchemyError:
+        db.rollback()
+        # 片段读取失败：退回到一定能打开的还原台（该缸仍展开）
+        return render(request, "bay.html", base_context)
     return render(
         request,
         "bay.html",
-        _bay_context(request, db, user, None, pk)
-        | {"fragment_lot_count": len(rows)},
+        base_context
+        | {
+            "fragment_vat_id": pk,
+            "fragment_lots": [_lot_dict(l) for l in rows],
+            "fragment_lot_count": len(rows),
+        },
     )
 
 

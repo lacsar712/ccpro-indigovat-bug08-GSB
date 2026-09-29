@@ -130,6 +130,29 @@
             </ul>
           </div>
         </div>
+
+        {% if fragment_lots is defined and fragment_vat_id == selected_vat %}
+        <div style="margin-top:1.15rem;border-top:1px dashed #b7cdd0;padding-top:0.9rem">
+          <h3 style="font-size:0.95rem;margin:0 0 0.4rem;color:#1f4d6b">按缸浸染列表片段
+            <span style="font-weight:400;color:#6b7c85">（条数 {{ fragment_lot_count }}）</span>
+          </h3>
+          <ul class="lot-list">
+            {% for l in fragment_lots %}
+            <li>
+              <span>{{ l.dippedAt }}</span>
+              <span>
+                <span>{{ "%.2f"|format(l.clothMeters) }} m</span>
+                ·
+                <span>{% if l.redoxMv is none %}无电位{% else %}{{ "%.2f"|format(l.redoxMv) }} mV{% endif %}</span>
+              </span>
+            </li>
+            {% endfor %}
+            {% if not fragment_lots %}
+            <li style="border:0;color:#6b7c85">尚无记录</li>
+            {% endif %}
+          </ul>
+        </div>
+        {% endif %}
       </div>
     </template>
   </div>
